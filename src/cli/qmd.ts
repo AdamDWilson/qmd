@@ -17,6 +17,8 @@ import {
   resolve,
   enableProductionMode,
   searchFTS,
+  searchFTSWithFallback,
+  ftsFallbackMin,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -95,6 +97,7 @@ import {
   type OutputFormat,
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
+import { logSearchEvent } from "./search-log.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -2391,6 +2394,7 @@ type OutputRow = {
   hash?: string;
   docid?: string;
   explain?: HybridQueryExplain;
+  partial?: boolean;  // wilson: matched only some query terms
 };
 
 const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
@@ -2522,6 +2526,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
+        ...(row.partial && { partial: true }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -2804,7 +2809,19 @@ function search(query: string, opts: OutputOptions): void {
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
+  // wilson: fall back to partial matches when too few documents contain every
+  // term. Size the fallback to the requested page (not fetchLimit), so a query
+  // with a couple of all-terms hits isn't padded with 50 weak partial ones.
+  const t0 = Date.now();
+  const strict = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
+  const results = strict.length >= Math.min(ftsFallbackMin(), opts.limit)
+    ? strict
+    : searchFTSWithFallback(db, query, opts.all ? fetchLimit : opts.limit, collectionSearchFilter(collectionNames));
+  const partialCount = results.filter(r => r.partial).length;
+  if (partialCount > 0) {
+    process.stderr.write(`Note: ${partialCount} result(s) match only some of the query terms (no more documents contain all of them).\n`);
+  }
+  logSearchEvent("search", query, collectionNames, opts.limit, results.length - partialCount, partialCount, Date.now() - t0);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2816,6 +2833,7 @@ function search(query: string, opts: OutputOptions): void {
     context: getContextForFile(db, r.filepath),
     hash: r.hash,
     docid: r.docid,
+    partial: r.partial,
   }));
 
   closeDb();
@@ -2850,6 +2868,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
   checkIndexHealth(store.db);
+  const t0 = Date.now();
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
@@ -2866,6 +2885,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     });
 
     closeDb();
+    logSearchEvent("vsearch", query, collectionNames, opts.limit, results.length, 0, Date.now() - t0);
 
     if (results.length === 0) {
       printEmptySearchResults(opts.format);
@@ -2885,6 +2905,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+  const queryT0 = Date.now();  // wilson: search log
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2986,6 +3007,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     }
 
     closeDb();
+    logSearchEvent("query", query, collectionNames, opts.limit, results.length, 0, Date.now() - queryT0);
 
     if (results.length === 0) {
       printEmptySearchResults(opts.format);

@@ -17,6 +17,8 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  buildFTS5Query,
+  searchFTSWithFallback,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -5284,5 +5286,80 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+// =============================================================================
+// wilson: partial-match fallback and list-separator splitting
+// =============================================================================
+
+describe("wilson: buildFTS5Query separators and joiner", () => {
+  test("list separators split into separate terms", () => {
+    expect(buildFTS5Query("rrsp/tfsa")).toBe('"rrsp"* AND "tfsa"*');
+    expect(buildFTS5Query("R&D budget")).toBe('"r"* AND "d"* AND "budget"*');
+    expect(buildFTS5Query("cats,dogs")).toBe('"cats"* AND "dogs"*');
+  });
+
+  test("negation applies to every part of a split term", () => {
+    expect(buildFTS5Query("budget -rrsp/tfsa")).toBe('"budget"* NOT "rrsp"* NOT "tfsa"*');
+  });
+
+  test("hyphenated and quoted terms are unchanged", () => {
+    expect(buildFTS5Query("multi-agent memory")).toBe('"multi agent" AND "memory"*');
+    expect(buildFTS5Query('"gift deed" lawyer')).toBe('"gift deed" AND "lawyer"*');
+  });
+
+  test("OR joiner", () => {
+    expect(buildFTS5Query("exit november", "OR")).toBe('"exit"* OR "november"*');
+  });
+});
+
+describe("wilson: searchFTSWithFallback", () => {
+  test("returns all-terms matches only when there are enough", async () => {
+    const store = await createTestStore();
+    const coll = await createTestCollection({ name: "notes", pwd: "/test/notes" });
+    for (let i = 0; i < 3; i++) {
+      await insertTestDocument(store.db, coll, { name: `b${i}`, title: `Boiler ${i}`, body: "boiler leak in the rental", displayPath: `b${i}.md` });
+    }
+    await insertTestDocument(store.db, coll, { name: "x", title: "Other", body: "boiler maintenance only", displayPath: "x.md" });
+    const r = searchFTSWithFallback(store.db, "boiler leak", 10, coll);
+    expect(r).toHaveLength(3);
+    expect(r.every(x => !x.partial)).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("falls back to partial matches when one term is missing everywhere", async () => {
+    const store = await createTestStore();
+    const coll = await createTestCollection({ name: "notes", pwd: "/test/notes" });
+    await insertTestDocument(store.db, coll, { name: "exit", title: "Google exit", body: "Separation Date Nov 13. Exit Extension approved.", displayPath: "exit.md" });
+    await insertTestDocument(store.db, coll, { name: "other", title: "Unrelated", body: "Nothing about it here.", displayPath: "other.md" });
+    const r = searchFTSWithFallback(store.db, "exit extension separation November", 10, coll);
+    expect(r.map(x => x.displayPath)).toEqual([`${coll}/exit.md`]);
+    expect(r[0]!.partial).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("all-terms matches rank ahead of partial ones", async () => {
+    const store = await createTestStore();
+    const coll = await createTestCollection({ name: "notes", pwd: "/test/notes" });
+    await insertTestDocument(store.db, coll, { name: "both", title: "A", body: "title insurance lawyer", displayPath: "both.md" });
+    await insertTestDocument(store.db, coll, { name: "one", title: "B", body: "title insurance title insurance title insurance", displayPath: "one.md" });
+    const r = searchFTSWithFallback(store.db, "title insurance lawyer", 10, coll);
+    expect(r.map(x => x.displayPath)).toEqual([`${coll}/both.md`, `${coll}/one.md`]);
+    expect(r.map(x => !!x.partial)).toEqual([false, true]);
+    await cleanupTestDb(store);
+  });
+
+  test("QMD_FTS_FALLBACK_MIN=0 disables the fallback", async () => {
+    const store = await createTestStore();
+    const coll = await createTestCollection({ name: "notes", pwd: "/test/notes" });
+    await insertTestDocument(store.db, coll, { name: "exit", title: "Google exit", body: "Separation Date Nov 13.", displayPath: "exit.md" });
+    process.env.QMD_FTS_FALLBACK_MIN = "0";
+    try {
+      expect(searchFTSWithFallback(store.db, "separation November", 10, coll)).toHaveLength(0);
+    } finally {
+      delete process.env.QMD_FTS_FALLBACK_MIN;
+    }
+    await cleanupTestDb(store);
   });
 });

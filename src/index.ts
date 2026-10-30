@@ -44,6 +44,7 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   clearAllEmbeddings,
+  searchFTSWithFallback,
   type Store as InternalStore,
   type DocumentResult,
   type DocumentNotFound,
@@ -432,7 +433,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
+    // wilson: keyword search with the partial-match fallback (see searchFTSWithFallback)
+    searchLex: async (q, opts) => searchFTSWithFallback(internal.db, q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),

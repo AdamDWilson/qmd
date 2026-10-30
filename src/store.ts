@@ -2419,6 +2419,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  partial?: boolean;          // wilson: matched only some query terms (searchFTSWithFallback)
 };
 
 /**
@@ -3885,7 +3886,7 @@ function sanitizeDottedTerm(term: string): string {
  *   DEC-0054               → "dec 0054"
  *   -multi-agent            → NOT "multi agent"
  */
-function buildFTS5Query(query: string): string | null {
+export function buildFTS5Query(query: string, joiner: "AND" | "OR" = "AND"): string | null {
   const positive: string[] = [];
   const negative: string[] = [];
 
@@ -3923,56 +3924,62 @@ function buildFTS5Query(query: string): string | null {
       // Plain term (until whitespace or quote)
       const start = i;
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-      const term = s.slice(start, i);
+      const rawTerm = s.slice(start, i);
 
-      // Handle hyphenated tokens: multi-agent, DEC-0054, gpt-4
-      // These get split into phrase queries so FTS5 porter tokenizer matches them.
-      if (isHyphenatedToken(term)) {
-        const sanitized = sanitizeHyphenatedTerm(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // Phrase match (no prefix)
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      } else if (isDottedToken(term)) {
-        // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
-        // The porter tokenizer splits on dots, so the index has individual tokens.
-        // We AND all parts together so the query matches documents containing all parts.
-        const sanitized = sanitizeDottedTerm(term);
-        if (sanitized) {
-          // sanitizeDottedTerm already wraps each part in quotes with prefix match
-          if (negated) {
-            // Wrap multi-token AND expression in parens for NOT negation
-            negative.push(`(${sanitized})`);
-          } else {
-            // Flatten individual AND'd terms into the positive list so they combine
-            // correctly with other terms (avoids double-wrapping in outer AND).
-            for (const part of sanitized.split(' AND ')) {
-              positive.push(part.trim());
+      // wilson: list separators join words that are really separate terms
+      // ("rrsp/tfsa", "R&D", "cats,dogs"). sanitizeFTS5Term would strip the
+      // separator and fuse them into one token that never matches, so split
+      // first and treat each part as its own term (sharing any negation).
+      for (const term of rawTerm.split(/[\/&+,;|]+/).filter(t => t.length > 0)) {
+        // Handle hyphenated tokens: multi-agent, DEC-0054, gpt-4
+        // These get split into phrase queries so FTS5 porter tokenizer matches them.
+        if (isHyphenatedToken(term)) {
+          const sanitized = sanitizeHyphenatedTerm(term);
+          if (sanitized) {
+            const ftsPhrase = `"${sanitized}"`;  // Phrase match (no prefix)
+            if (negated) {
+              negative.push(ftsPhrase);
+            } else {
+              positive.push(ftsPhrase);
             }
           }
-        }
-      } else if (containsCjk(term)) {
-        const sanitized = sanitizeFTS5Phrase(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
+        } else if (isDottedToken(term)) {
+          // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
+          // The porter tokenizer splits on dots, so the index has individual tokens.
+          // We AND all parts together so the query matches documents containing all parts.
+          const sanitized = sanitizeDottedTerm(term);
+          if (sanitized) {
+            // sanitizeDottedTerm already wraps each part in quotes with prefix match
+            if (negated) {
+              // Wrap multi-token AND expression in parens for NOT negation
+              negative.push(`(${sanitized})`);
+            } else {
+              // Flatten individual AND'd terms into the positive list so they combine
+              // correctly with other terms (avoids double-wrapping in outer AND).
+              for (const part of sanitized.split(' AND ')) {
+                positive.push(part.trim());
+              }
+            }
           }
-        }
-      } else {
-        const sanitized = sanitizeFTS5Term(term);
-        if (sanitized) {
-          const ftsTerm = `"${sanitized}"*`;  // Prefix match
-          if (negated) {
-            negative.push(ftsTerm);
-          } else {
-            positive.push(ftsTerm);
+        } else if (containsCjk(term)) {
+          const sanitized = sanitizeFTS5Phrase(term);
+          if (sanitized) {
+            const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
+            if (negated) {
+              negative.push(ftsPhrase);
+            } else {
+              positive.push(ftsPhrase);
+            }
+          }
+        } else {
+          const sanitized = sanitizeFTS5Term(term);
+          if (sanitized) {
+            const ftsTerm = `"${sanitized}"*`;  // Prefix match
+            if (negated) {
+              negative.push(ftsTerm);
+            } else {
+              positive.push(ftsTerm);
+            }
           }
         }
       }
@@ -3984,8 +3991,8 @@ function buildFTS5Query(query: string): string | null {
   // If only negative terms, we can't search (FTS5 NOT is binary)
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
+  // Join positive terms with AND (default) or OR (wilson: partial-match fallback)
+  let result = positive.join(` ${joiner} `);
 
   // Add NOT clause for negative terms
   for (const neg of negative) {
@@ -4043,16 +4050,54 @@ function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): Sear
     .slice(0, limit);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[]): SearchResult[] {
+/**
+ * wilson: minimum number of all-terms BM25 hits before the partial-match fallback
+ * kicks in. `QMD_FTS_FALLBACK_MIN=0` disables the fallback.
+ */
+export function ftsFallbackMin(): number {
+  const raw = process.env.QMD_FTS_FALLBACK_MIN;
+  const n = raw === undefined || raw === "" ? 3 : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
+}
+
+/**
+ * wilson: BM25 keyword search that never comes back empty just because one query
+ * word is missing from the notes.
+ *
+ * Upstream joins every term with AND, so "exit date extension separation November"
+ * returns nothing when the note says "Nov 13" (compare #976 for the CJK form of the
+ * same problem). This runs the all-terms query first; if it finds fewer than
+ * `ftsFallbackMin()` documents (capped at `limit`), it re-runs the query with the
+ * terms joined by OR and appends documents not already returned, flagged
+ * `partial: true`. All-terms matches always rank first. Negated terms still apply.
+ *
+ * Used by the keyword paths only (`qmd search`, SDK `searchLex`). Hybrid `qmd query`
+ * keeps upstream semantics so its rank fusion is unchanged.
+ */
+export function searchFTSWithFallback(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[]): SearchResult[] {
+  const full = searchFTS(db, query, limit, collectionName);
+  const min = Math.min(ftsFallbackMin(), limit);
+  if (full.length >= min) return full;
+  const anyQuery = buildFTS5Query(query, "OR");
+  if (!anyQuery || anyQuery === buildFTS5Query(query, "AND")) return full;  // single term: nothing to relax
+  const seen = new Set(full.map(r => r.filepath));
+  const extra = searchFTS(db, query, limit, collectionName, "OR")
+    .filter(r => !seen.has(r.filepath))
+    .slice(0, Math.max(0, limit - full.length))
+    .map(r => ({ ...r, partial: true }));
+  return [...full, ...extra];
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], joiner: "AND" | "OR" = "AND"): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   // Search each requested collection before merging/truncating so a large
   // unrelated collection cannot occupy global top-k and starve the rest (#775).
   if (names && names.length > 1) {
-    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name)), limit);
+    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name, joiner)), limit);
   }
   const collectionFilter = names?.[0];
 
-  const ftsQuery = buildFTS5Query(query);
+  const ftsQuery = buildFTS5Query(query, joiner);
   if (!ftsQuery) return [];
 
   // Use a CTE to force FTS5 to run first, then filter by collection.
